@@ -1,5 +1,6 @@
 import json
-import math
+import logging
+from typing import Any, Dict, List, Tuple, Optional
 
 from django.db import transaction
 from django.db.models import Prefetch
@@ -9,11 +10,13 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
 from ..models import Event, Market, MarketOption, MarketOptionStats
+from ..services.amm.setup import AmmSetupError, ensure_pool_initialized, normalize_amm_params
 from ..services.auth import get_user_from_request, require_admin
 from ..services.events import binary_options_from_payload
 from ..services.parsing import parse_iso_datetime
 from ..services.serializers import serialize_event
 
+logger = logging.getLogger(__name__)
 
 ALLOWED_EVENT_STATUSES = {
     "draft",
@@ -23,6 +26,8 @@ ALLOWED_EVENT_STATUSES = {
     "resolved",
     "canceled",
 }
+
+ALLOWED_GROUP_RULES = {"standalone", "exclusive", "independent"}
 
 
 def _decode_payload(request):
@@ -45,10 +50,45 @@ def _prefetched_event(event_id):
     )
 
 
+def _split_bps(total: int, n: int) -> List[int]:
+    """Split total into n ints such that sum == total, deterministic."""
+    if n <= 0:
+        return []
+    base, rem = divmod(total, n)
+    return [base + (1 if i < rem else 0) for i in range(n)]
+
+
+def _derive_group_rule(payload: Dict[str, Any], markets_data: List[Dict[str, Any]], options_data: List[Dict[str, Any]]) -> str:
+    """
+    Backward compatible + safe:
+      - If payload.group_rule provided: validate and use.
+      - Else if markets were inferred from payload.options (no explicit markets list): treat as 'exclusive'.
+      - Else if explicit markets list has len>1: default to 'independent'.
+      - Else: 'standalone'.
+    """
+    explicit = payload.get("group_rule")
+    if explicit is not None:
+        rule = str(explicit).strip().lower()
+        if rule not in ALLOWED_GROUP_RULES:
+            raise ValueError("Invalid group_rule")
+        return rule
+
+    has_explicit_markets = isinstance(payload.get("markets"), list) and len(payload.get("markets") or []) > 0
+    inferred_from_options = (not has_explicit_markets) and bool(options_data)
+
+    if inferred_from_options:
+        return "exclusive"
+
+    if has_explicit_markets and len(markets_data) > 1:
+        return "independent"
+
+    return "standalone"
+
+
 def _normalize_markets_payload(payload, title, description, trading_deadline, resolution_deadline):
-    event_group_rule = payload.get("group_rule") or "standalone"
     markets_data = payload.get("markets")
     options_data = payload.get("options") or []
+
     if not isinstance(markets_data, list) or len(markets_data) == 0:
         if options_data:
             markets_data = [
@@ -59,42 +99,83 @@ def _normalize_markets_payload(payload, title, description, trading_deadline, re
         else:
             markets_data = [{"title": title, "description": description}]
 
-    if len(markets_data) > 1 and event_group_rule == "standalone":
-        event_group_rule = "exclusive"
+    event_group_rule = _derive_group_rule(payload, markets_data, options_data)
 
-    # Ensure defaults for missing description / deadlines per market
+    # Safety: standalone must be single-market; reject ambiguity instead of silently coercing.
+    if event_group_rule == "standalone" and len(markets_data) > 1:
+        raise ValueError("group_rule='standalone' requires exactly 1 market. Use 'independent' or 'exclusive'.")
+
+    defaults = {
+        "title": title,
+        "description": description,
+        "status": "draft",
+        "market_kind": "binary",
+        "options": [],
+        "amm": None,
+        "category": None,
+        "cover_url": None,
+        "slug": None,
+        "contract_address": None,
+        "onchain_market_id": None,
+        "create_tx_hash": None,
+        "is_hidden": False,
+        "assertion_text": None,
+        "bucket_label": None,
+        "sort_weight": 0,
+        "chain": payload.get("chain"),
+    }
+
     normalized = []
     for idx, market_data in enumerate(markets_data):
         data = market_data or {}
         normalized.append(
             {
+                **defaults,
+                **data,  # allow per-market overrides
                 "title": data.get("title") or title,
                 "description": data.get("description") or description,
                 "trading_deadline": parse_iso_datetime(data.get("trading_deadline")) or trading_deadline,
                 "resolution_deadline": parse_iso_datetime(data.get("resolution_deadline")) or resolution_deadline,
-                "category": data.get("category"),
-                "cover_url": data.get("cover_url"),
-                "slug": data.get("slug"),
-                "status": "draft",
                 "chain": data.get("chain") or payload.get("chain"),
-                "contract_address": data.get("contract_address"),
-                "onchain_market_id": data.get("onchain_market_id"),
-                "create_tx_hash": data.get("create_tx_hash"),
                 "is_hidden": data.get("is_hidden", False),
                 "sort_weight": data.get("sort_weight", idx),
-                "market_kind": "binary",
-                "assertion_text": data.get("assertion_text"),
-                "bucket_label": data.get("bucket_label"),
                 "options": data.get("options") or [],
+                "amm": data.get("amm"),  # FIX: correct key placement
             }
         )
+
     return normalized, event_group_rule
 
 
-def _create_event_with_markets(event_fields, markets_data, payload, created_by):
+def _pick_yes_no_options(options: List[MarketOption]) -> Tuple[Optional[MarketOption], Optional[MarketOption], bool]:
+    """
+    Returns (yes_opt, no_opt, used_fallback).
+
+    Strategy:
+      - Prefer side='yes'/'no' if present.
+      - Else fallback to option_index ordering (assume index 0 is YES, index 1 is NO) and mark used_fallback=True.
+    """
+    yes_opt = next((o for o in options if getattr(o, "side", None) == "yes"), None)
+    no_opt = next((o for o in options if getattr(o, "side", None) == "no"), None)
+    if yes_opt and no_opt:
+        return yes_opt, no_opt, False
+
+    ordered = sorted(options, key=lambda o: (getattr(o, "option_index", 0), getattr(o, "id", 0)))
+    if len(ordered) >= 2:
+        return ordered[0], ordered[1], True
+    return None, None, True
+
+
+def _create_event_with_markets(event_fields, markets_data, amm_params_list, payload, created_by):
     created_markets = []
     with transaction.atomic():
         event = Event.objects.create(**event_fields, created_by_id=created_by)
+
+        now = timezone.now()
+
+        # For exclusive, we want sum(YES across markets) == 10000
+        exclusive_yes_splits = _split_bps(10000, len(markets_data)) if event.group_rule == "exclusive" else []
+
         for idx, market_data in enumerate(markets_data):
             market = Market.objects.create(
                 event=event,
@@ -102,20 +183,20 @@ def _create_event_with_markets(event_fields, markets_data, payload, created_by):
                 description=market_data["description"],
                 trading_deadline=market_data["trading_deadline"],
                 resolution_deadline=market_data["resolution_deadline"],
-                category=market_data["category"] or payload.get("category"),
-                cover_url=market_data["cover_url"] or payload.get("cover_url"),
-                slug=market_data["slug"],
-                status=market_data["status"],
-                chain=market_data["chain"],
-                contract_address=market_data["contract_address"],
-                onchain_market_id=market_data["onchain_market_id"],
-                create_tx_hash=market_data["create_tx_hash"],
-                is_hidden=market_data["is_hidden"],
-                sort_weight=market_data["sort_weight"],
+                category=market_data.get("category") or payload.get("category"),
+                cover_url=market_data.get("cover_url") or payload.get("cover_url"),
+                slug=market_data.get("slug"),
+                status=market_data.get("status") or "draft",
+                chain=market_data.get("chain") or payload.get("chain"),
+                contract_address=market_data.get("contract_address"),
+                onchain_market_id=market_data.get("onchain_market_id"),
+                create_tx_hash=market_data.get("create_tx_hash"),
+                is_hidden=market_data.get("is_hidden", False),
+                sort_weight=market_data.get("sort_weight", idx),
                 created_by_id=created_by,
-                market_kind=market_data["market_kind"],
-                assertion_text=market_data["assertion_text"],
-                bucket_label=market_data["bucket_label"],
+                market_kind=market_data.get("market_kind") or "binary",
+                assertion_text=market_data.get("assertion_text"),
+                bucket_label=market_data.get("bucket_label"),
             )
 
             raw_options = market_data.get("options") or []
@@ -124,22 +205,99 @@ def _create_event_with_markets(event_fields, markets_data, payload, created_by):
                 opt.market = market
             MarketOption.objects.bulk_create(parsed_options)
 
-            stats = []
-            now = timezone.now()
-            per_bps = math.ceil(10000 / len(parsed_options) / 10) * 10 if parsed_options else 5000
-            for opt in parsed_options:
-                stats.append(
-                    MarketOptionStats(
-                        option=opt,
-                        market=market,
-                        prob_bps=per_bps,
-                        volume_24h=0,
-                        volume_total=0,
-                        updated_at=now,
-                    )
-                )
-            MarketOptionStats.objects.bulk_create(stats)
+            # Refetch for guaranteed PKs / canonical ordering
+            persisted_opts = list(
+                MarketOption.objects.filter(market=market, is_active=True).order_by("option_index", "id")
+            )
+
+            # Init stats (display only) with strict sum-to-10000
+            stats_rows = []
+
+            if persisted_opts:
+                if event.group_rule == "exclusive" and len(persisted_opts) >= 2:
+                    yes_target = exclusive_yes_splits[idx] if idx < len(exclusive_yes_splits) else 0
+                    no_target = 10000 - yes_target
+                    yes_opt, no_opt, used_fallback = _pick_yes_no_options(persisted_opts)
+
+                    if used_fallback:
+                        logger.warning(
+                            "exclusive init: market %s options missing side yes/no; assuming option_index 0=YES 1=NO",
+                            market.id,
+                        )
+
+                    # If we still can't pick, fall back to equal split (should be rare)
+                    if yes_opt is None or no_opt is None:
+                        splits = _split_bps(10000, len(persisted_opts))
+                        for opt, prob in zip(persisted_opts, splits):
+                            stats_rows.append(
+                                MarketOptionStats(
+                                    option=opt,
+                                    market=market,
+                                    prob_bps=prob,
+                                    volume_24h=0,
+                                    volume_total=0,
+                                    updated_at=now,
+                                )
+                            )
+                    else:
+                        for opt in persisted_opts:
+                            if opt.id == yes_opt.id:
+                                prob = yes_target
+                            elif opt.id == no_opt.id:
+                                prob = no_target
+                            else:
+                                prob = 0
+                            stats_rows.append(
+                                MarketOptionStats(
+                                    option=opt,
+                                    market=market,
+                                    prob_bps=prob,
+                                    volume_24h=0,
+                                    volume_total=0,
+                                    updated_at=now,
+                                )
+                            )
+                else:
+                    splits = _split_bps(10000, len(persisted_opts))
+                    for opt, prob in zip(persisted_opts, splits):
+                        stats_rows.append(
+                            MarketOptionStats(
+                                option=opt,
+                                market=market,
+                                prob_bps=prob,
+                                volume_24h=0,
+                                volume_total=0,
+                                updated_at=now,
+                            )
+                        )
+
+            if stats_rows:
+                MarketOptionStats.objects.bulk_create(stats_rows)
+
             created_markets.append(market)
+
+        # Create AMM pools
+        if event.group_rule == "exclusive":
+            # In exclusive mode, params must be consistent; using "first" silently is dangerous
+            base = amm_params_list[0] if amm_params_list else normalize_amm_params()
+            for p in (amm_params_list or []):
+                if (
+                    p.get("model") != base.get("model")
+                    or p.get("b") != base.get("b")
+                    or p.get("fee_bps") != base.get("fee_bps")
+                    or p.get("collateral_token") != base.get("collateral_token")
+                ):
+                    raise AmmSetupError("exclusive event requires identical amm params across markets")
+
+            ensure_pool_initialized(event=event, amm_params=base, created_by_id=created_by)
+        else:
+            # standalone / independent => market-level pools
+            for i, m in enumerate(created_markets):
+                if amm_params_list and i < len(amm_params_list):
+                    p = amm_params_list[i]
+                else:
+                    p = normalize_amm_params()
+                ensure_pool_initialized(market=m, amm_params=p, created_by_id=created_by)
 
         if created_markets:
             event.primary_market = created_markets[0]
@@ -210,9 +368,25 @@ def create_event(request):
 
     trading_deadline = parse_iso_datetime(payload.get("trading_deadline"))
     resolution_deadline = parse_iso_datetime(payload.get("resolution_deadline"))
-    markets_data, event_group_rule = _normalize_markets_payload(
-        payload, title, description, trading_deadline, resolution_deadline
-    )
+
+    if not trading_deadline:
+        return JsonResponse({"error": "trading_deadline is required"}, status=400)
+
+    try:
+        markets_data, event_group_rule = _normalize_markets_payload(
+            payload, title, description, trading_deadline, resolution_deadline
+        )
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+
+    amm_defaults = payload.get("amm") or {}
+    amm_params_list = []
+    try:
+        for market_data in markets_data:
+            amm_params_list.append(normalize_amm_params(market_data.get("amm"), defaults=amm_defaults))
+    except AmmSetupError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+
     created_by = payload.get("created_by")
     event_fields = {
         "title": title,
@@ -228,7 +402,7 @@ def create_event(request):
         "resolution_deadline": resolution_deadline,
     }
 
-    event = _create_event_with_markets(event_fields, markets_data, payload, created_by)
+    event = _create_event_with_markets(event_fields, markets_data, amm_params_list, payload, created_by)
     event = _prefetched_event(event.id)
     return JsonResponse(serialize_event(event), status=201)
 
@@ -249,9 +423,7 @@ def publish_event(request, event_id):
         return JsonResponse({"error": "Event not found"}, status=404)
 
     if event.status not in {"draft", "pending"}:
-        return JsonResponse(
-            {"error": f"Cannot publish event in status '{event.status}'"}, status=400
-        )
+        return JsonResponse({"error": f"Cannot publish event in status '{event.status}'"}, status=400)
 
     now = timezone.now()
     with transaction.atomic():
@@ -259,6 +431,13 @@ def publish_event(request, event_id):
         event.updated_at = now
         event.save(update_fields=["status", "updated_at"])
         Market.objects.filter(event=event).update(status="active", updated_at=now)
+
+    # Self-healing: ensure AMM pool exists even if create_event partially succeeded earlier
+    if event.group_rule == "exclusive":
+        ensure_pool_initialized(event=event, amm_params=normalize_amm_params())
+    else:
+        for market in Market.objects.filter(event=event):
+            ensure_pool_initialized(market=market, amm_params=normalize_amm_params())
 
     event = _prefetched_event(event_id)
     return JsonResponse(serialize_event(event), status=200)
@@ -298,4 +477,3 @@ def update_event_status(request, event_id):
 
     event = _prefetched_event(event_id)
     return JsonResponse(serialize_event(event), status=200)
-

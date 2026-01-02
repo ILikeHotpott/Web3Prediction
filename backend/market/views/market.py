@@ -9,6 +9,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
 from ..models import Market, MarketOption, MarketOptionStats
+from ..services.amm.setup import AmmSetupError, ensure_pool_initialized, normalize_amm_params
 from ..services.auth import get_user_from_request, require_admin
 from ..services.parsing import parse_iso_datetime
 from ..services.serializers import serialize_market
@@ -77,10 +78,15 @@ def _parse_market_payload(payload):
         "sort_weight": payload.get("sort_weight", 0),
         "created_by_id": payload.get("created_by"),
     }
-    return market_fields, parsed_options, None
+    try:
+        amm_params = normalize_amm_params(payload.get("amm"))
+    except AmmSetupError as exc:
+        return None, None, None, JsonResponse({"error": str(exc)}, status=400)
+
+    return market_fields, parsed_options, amm_params, None
 
 
-def _create_market_with_options(market_fields, parsed_options):
+def _create_market_with_options(market_fields, parsed_options, amm_params):
     with transaction.atomic():
         market = Market.objects.create(**market_fields)
         for opt in parsed_options:
@@ -104,6 +110,11 @@ def _create_market_with_options(market_fields, parsed_options):
                     )
                 )
             MarketOptionStats.objects.bulk_create(stats)
+        ensure_pool_initialized(
+            market,
+            amm_params or normalize_amm_params(),
+            created_by_id=market_fields.get("created_by_id"),
+        )
     return market
 
 
@@ -159,11 +170,11 @@ def create_market(request):
     if error:
         return error
 
-    market_fields, parsed_options, parse_error = _parse_market_payload(payload)
+    market_fields, parsed_options, amm_params, parse_error = _parse_market_payload(payload)
     if parse_error:
         return parse_error
 
-    market = _create_market_with_options(market_fields, parsed_options)
+    market = _create_market_with_options(market_fields, parsed_options, amm_params)
 
     return JsonResponse(serialize_market(market), status=201)
 
@@ -189,6 +200,9 @@ def publish_market(request, market_id):
     market.status = "active"
     market.updated_at = timezone.now()
     market.save(update_fields=["status", "updated_at"])
+
+    # Backfill AMM if missing (idempotent).
+    ensure_pool_initialized(market, normalize_amm_params())
 
     return JsonResponse(serialize_market(market), status=200)
 

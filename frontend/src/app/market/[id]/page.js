@@ -5,6 +5,7 @@ import Navigation from "@/components/Navigation"
 import MarketChart from "@/components/MarketChart"
 import Comments from "@/components/Comments"
 import LoadingSpinner from "@/components/LoadingSpinner"
+import Toast from "@/components/Toast"
 import { useAuth } from "@/components/auth/AuthProvider"
 import { useParams } from "next/navigation"
 
@@ -26,6 +27,8 @@ export default function MarketDetail({ params }) {
   const [placing, setPlacing] = useState(false)
   const [error, setError] = useState("")
   const [success, setSuccess] = useState("")
+  const [toastMessage, setToastMessage] = useState("")
+  const [toastType, setToastType] = useState("success")
   const [balance, setBalance] = useState(null)
   const [positionsMap, setPositionsMap] = useState({})
 
@@ -342,12 +345,21 @@ export default function MarketDetail({ params }) {
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || "下单失败")
-      setSuccess(isSellSide ? "卖出成功" : "下单成功")
+      
+      // 显示成功提示
+      const successMsg = isSellSide ? "卖出成功" : "下单成功"
+      setSuccess(successMsg)
+      setToastMessage(successMsg)
+      setToastType("success")
+      
+      // 更新余额
       setBalance({
         token: data.token,
         available_amount: data.balance_available,
         locked_amount: balance?.locked_amount ?? "0",
       })
+      
+      // 更新持仓
       const optId = normalizeId(data.option_id || selectedOption.id)
       if (optId && data.position?.shares != null) {
         const sharesNum = Number(data.position.shares)
@@ -356,8 +368,41 @@ export default function MarketDetail({ params }) {
           [optId]: Number.isFinite(sharesNum) ? sharesNum : prev[optId] || 0,
         }))
       }
+      
+      // 使用API响应中的post_prob_bps更新本地价格，避免整页刷新
+      if (data.post_prob_bps && Array.isArray(data.post_prob_bps) && selectedMarket) {
+        setEventData((prev) => {
+          if (!prev) return prev
+          const updatedMarkets = (prev.markets || []).map((market) => {
+            if (normalizeId(market.id) !== normalizeId(selectedMarket.id)) {
+              return market
+            }
+            // 使用option_index来匹配，因为post_prob_bps数组索引对应option_index
+            const updatedOptions = (market.options || []).map((option) => {
+              const optionIdx = option.option_index ?? 0
+              const probBps = data.post_prob_bps[optionIdx]
+              if (probBps != null && probBps >= 0 && probBps <= 10000) {
+                return { ...option, probability_bps: probBps }
+              }
+              return option
+            })
+            return { ...market, options: updatedOptions }
+          })
+          return { ...prev, markets: updatedMarkets }
+        })
+      }
+      
+      // 清空输入框
+      setAmount("0")
+      
+      // 异步更新余额和持仓（不阻塞UI）
+      fetchBalance().catch(() => {})
+      fetchPositions().catch(() => {})
     } catch (e) {
-      setError(e.message || "下单失败")
+      const errorMsg = e.message || "下单失败"
+      setError(errorMsg)
+      setToastMessage(errorMsg)
+      setToastType("error")
     } finally {
       setPlacing(false)
     }
@@ -385,6 +430,15 @@ export default function MarketDetail({ params }) {
   return (
     <div className="min-h-screen bg-background">
       <Navigation />
+      <Toast
+        message={toastMessage}
+        type={toastType}
+        onClose={() => {
+          setToastMessage("")
+          setSuccess("")
+          setError("")
+        }}
+      />
       <div className="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-12 py-6">
         {loading && (
           <div className="py-10">
@@ -521,6 +575,11 @@ export default function MarketDetail({ params }) {
                       type="number"
                       value={amount}
                     onChange={(e) => {
+                      // 清除之前的成功/错误消息
+                      if (success || error) {
+                        setSuccess("")
+                        setError("")
+                      }
                       let val = e.target.value
                       if (val === "") {
                         setAmount("")

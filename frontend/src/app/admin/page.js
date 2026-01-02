@@ -29,6 +29,10 @@ export default function AdminMarketsPage() {
     cover_url: "",
     group_rule: "standalone",
     markets: defaultStandaloneMarkets,
+    amm_model: "lmsr",
+    amm_b: "10000",
+    amm_fee_bps: "0",
+    amm_collateral_token: "USDC",
   });
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -38,7 +42,16 @@ export default function AdminMarketsPage() {
     const marketsValid =
       Array.isArray(form.markets) &&
       form.markets.filter((o) => o.title?.trim()).length >= requiredMarkets;
-    return form.title && form.description && form.trading_deadline && marketsValid;
+    const bNum = Number(form.amm_b);
+    const feeNum = Number(form.amm_fee_bps);
+    const ammValid =
+      Number.isFinite(bNum) &&
+      bNum > 0 &&
+      Number.isFinite(feeNum) &&
+      feeNum >= 0 &&
+      feeNum < 10000 &&
+      (form.amm_collateral_token || "").trim();
+    return form.title && form.description && form.trading_deadline && marketsValid && ammValid;
   }, [form]);
 
   useEffect(() => {
@@ -142,27 +155,43 @@ export default function AdminMarketsPage() {
     setError("");
     setSuccess("");
     try {
+      const ammPayload = {
+        model: form.amm_model || "lmsr",
+        b: Number(form.amm_b),
+        fee_bps: Number(form.amm_fee_bps),
+        collateral_token: form.amm_collateral_token,
+      };
+      const payload = {
+        title: form.title,
+        description: form.description,
+        category: form.category,
+        trading_deadline: form.trading_deadline,
+        resolution_deadline: form.resolution_deadline,
+        slug: form.slug,
+        chain: form.chain,
+        cover_url: form.cover_url,
+        group_rule: form.group_rule || "standalone",
+        amm: ammPayload,
+        markets: (form.markets || []).map((m, idx) => ({
+          title: m.title,
+          bucket_label: m.bucket_label,
+          sort_weight: m.sort_weight ?? idx,
+          trading_deadline: form.trading_deadline,
+          resolution_deadline: form.resolution_deadline,
+          options: [
+            { title: "NO", side: "no", option_index: 0 },
+            { title: "YES", side: "yes", option_index: 1 },
+          ],
+          amm: ammPayload,
+        })),
+      };
       const res = await fetch(`${backendBase}/api/events/create/`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           ...(user ? { "X-User-Id": user.id } : {}),
         },
-        body: JSON.stringify({
-          ...form,
-          group_rule: form.group_rule || "standalone",
-          markets: (form.markets || []).map((m, idx) => ({
-            title: m.title,
-            bucket_label: m.bucket_label,
-            sort_weight: m.sort_weight ?? idx,
-            trading_deadline: form.trading_deadline,
-            resolution_deadline: form.resolution_deadline,
-            options: [
-              { title: "NO", side: "no", option_index: 0 },
-              { title: "YES", side: "yes", option_index: 1 },
-            ],
-          })),
-        }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -180,6 +209,10 @@ export default function AdminMarketsPage() {
           cover_url: "",
           group_rule: "standalone",
           markets: defaultStandaloneMarkets,
+          amm_model: "lmsr",
+          amm_b: "10000",
+          amm_fee_bps: "0",
+          amm_collateral_token: "USDC",
         });
         fetchEvents();
       }
@@ -347,6 +380,51 @@ export default function AdminMarketsPage() {
               </Button>
               {error && <span className="text-red-400">{error}</span>}
               {success && <span className="text-green-400">{success}</span>}
+            </div>
+            <div className="md:col-span-2 grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="text-sm text-gray-300">AMM 模型</label>
+                <input
+                  className="w-full mt-1 bg-[#0f172a] border border-[#334155] rounded-lg p-3 text-white"
+                  value={form.amm_model}
+                  onChange={(e) => handleChange("amm_model", e.target.value)}
+                  placeholder="lmsr"
+                />
+              </div>
+              <div>
+                <label className="text-sm text-gray-300">AMM b（流动性参数） *</label>
+                <input
+                  type="number"
+                  className="w-full mt-1 bg-[#0f172a] border border-[#334155] rounded-lg p-3 text-white"
+                  value={form.amm_b}
+                  onChange={(e) => handleChange("amm_b", e.target.value)}
+                  min="0"
+                  step="0.0001"
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-sm text-gray-300">交易费（bps） *</label>
+                <input
+                  type="number"
+                  className="w-full mt-1 bg-[#0f172a] border border-[#334155] rounded-lg p-3 text-white"
+                  value={form.amm_fee_bps}
+                  onChange={(e) => handleChange("amm_fee_bps", e.target.value)}
+                  min="0"
+                  max="9999"
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-sm text-gray-300">抵押资产标识 *</label>
+                <input
+                  className="w-full mt-1 bg-[#0f172a] border border-[#334155] rounded-lg p-3 text-white"
+                  value={form.amm_collateral_token}
+                  onChange={(e) => handleChange("amm_collateral_token", e.target.value)}
+                  placeholder="如 USDC 或合约地址"
+                  required
+                />
+              </div>
             </div>
           </form>
           {form.group_rule === "standalone" ? (

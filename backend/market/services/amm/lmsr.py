@@ -1,3 +1,6 @@
+# market/services/amm/lmsr.py
+from __future__ import annotations
+
 import math
 from typing import List, Sequence
 
@@ -93,25 +96,3 @@ def buy_amount_to_delta_q(
     # = log(1 + exp(log(t) + log_ratio))
     x = math.log(t) + log_ratio
     return b * _log1p_exp(x)
-
-
-if __name__ == "__main__":
-    b = 10000.0
-    q = [0.0, 0.0]
-
-    p0 = prices(q, b)
-    print("init q:", q, "p:", p0)
-    assert abs(p0[0] - 0.5) < 1e-12 and abs(p0[1] - 0.5) < 1e-12
-
-    amount_net = 1000.0
-    delta = buy_amount_to_delta_q(q, b, option_index=0, amount_net=amount_net)  # buy YES(0)
-    q2 = [q[0] + delta, q[1]]
-
-    p1 = prices(q2, b)
-    print("after buy yes delta:", delta)
-    print("new q:", q2, "p:", p1)
-
-    assert p1[0] > 0.5 and p1[1] < 0.5
-    assert abs(sum(p1) - 1.0) < 1e-12
-
-    print("cost diff:", cost(q2, b) - cost(q, b), "should ~= amount_net:", amount_net)

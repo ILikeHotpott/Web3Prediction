@@ -1,6 +1,6 @@
 from django.urls import path
 
-from .views import comments, events, market, orders, users
+from .views import amm, comments, events, market, orders, users
 
 urlpatterns = [
     # Event-first APIs
@@ -46,6 +46,11 @@ urlpatterns = [
         "api/markets/<uuid:market_id>/orders/sell/",
         orders.place_sell_order,
         name="market-order-sell",
+    ),
+    path(
+        "api/markets/<uuid:market_id>/quote/",
+        amm.quote,
+        name="market-quote",
     ),
     path(
         "api/markets/<uuid:market_id>/comments/",
